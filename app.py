@@ -29,6 +29,10 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dca_bitcoin.
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
+def _col_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == col for r in rows)
+
 
 def init_db():
     with get_conn() as conn:
@@ -42,6 +46,7 @@ def init_db():
                 usd_equivalente       REAL    NOT NULL,
                 btc_adquirido         REAL    NOT NULL,
                 precio_compra_btc_usd REAL    NOT NULL,
+                moneda_gasto          TEXT,
                 notas                 TEXT
             )
         """
@@ -59,18 +64,21 @@ def init_db():
             )
         """
         )
+        # Migraciones ligeras (para usuarios con DB previa)
+        if not _col_exists(conn, "dca_records", "moneda_gasto"):
+            conn.execute("ALTER TABLE dca_records ADD COLUMN moneda_gasto TEXT")
         conn.commit()
 
 
-def insertar_registro(mxn, tc, usd, btc, precio, notas):
+def insertar_registro(mxn, tc, usd, btc, precio, moneda_gasto, notas):
     fecha = datetime.now(CDMX_TZ).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO dca_records
                (fecha, mxn_gastado, tipo_cambio_mxn_usd, usd_equivalente,
-                btc_adquirido, precio_compra_btc_usd, notas)
-               VALUES (?,?,?,?,?,?,?)""",
-            (fecha, mxn, tc, usd, btc, precio, notas),
+                btc_adquirido, precio_compra_btc_usd, moneda_gasto, notas)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (fecha, mxn, tc, usd, btc, precio, moneda_gasto, notas),
         )
         conn.commit()
 
@@ -86,6 +94,34 @@ def obtener_registros() -> pd.DataFrame:
 def eliminar_registro(record_id: int):
     with get_conn() as conn:
         conn.execute("DELETE FROM dca_records WHERE id = ?", (record_id,))
+        conn.commit()
+
+
+def actualizar_registro(
+    record_id: int,
+    mxn: float,
+    tc: float,
+    btc: float,
+    precio_btc_usd: float,
+    moneda_gasto: str,
+    notas: str,
+):
+    usd = mxn / tc if tc > 0 else 0.0
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE dca_records
+            SET mxn_gastado = ?,
+                tipo_cambio_mxn_usd = ?,
+                usd_equivalente = ?,
+                btc_adquirido = ?,
+                precio_compra_btc_usd = ?,
+                moneda_gasto = ?,
+                notas = ?
+            WHERE id = ?
+            """,
+            (mxn, tc, usd, btc, precio_btc_usd, moneda_gasto, notas, record_id),
+        )
         conn.commit()
 
 
@@ -250,15 +286,6 @@ with tab_registro:
     with col_izq:
         st.markdown("#### 💵 Datos en pesos MXN")
 
-        mxn_gastado = st.number_input(
-            "MXN gastados",
-            min_value=0.0,
-            value=0.0,
-            step=100.0,
-            format="%.2f",
-            help="Cantidad total en pesos mexicanos que gastaste en esta compra",
-        )
-
         tipo_cambio = st.number_input(
             "Tipo de cambio (MXN por 1 USD)",
             min_value=0.01,
@@ -268,12 +295,43 @@ with tab_registro:
             help="Puedes ajustar este valor si el de tu exchange difiere",
         )
 
-        usd_equivalente = mxn_gastado / tipo_cambio if tipo_cambio > 0 else 0.0
+        moneda_gasto = st.radio(
+            "Registrar gasto en:",
+            options=["MXN", "USD (USDC/USDT)"],
+            horizontal=True,
+            key="moneda_gasto_compra",
+            help="Si compraste con USDC/USDT, elige USD.",
+        )
+
+        if moneda_gasto == "MXN":
+            mxn_gastado = st.number_input(
+                "MXN gastados",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                format="%.2f",
+                help="Cantidad total en pesos mexicanos que gastaste en esta compra",
+            )
+            usd_input = None
+            usd_equivalente = mxn_gastado / tipo_cambio if tipo_cambio > 0 else 0.0
+        else:
+            usd_input = st.number_input(
+                "USD gastados (USDC/USDT = USD)",
+                min_value=0.0,
+                value=0.0,
+                step=5.0,
+                format="%.4f",
+                help="Monto en USD (o equivalente en stablecoins) que usaste para comprar BTC",
+            )
+            usd_equivalente = float(usd_input)
+            mxn_gastado = usd_input * tipo_cambio if tipo_cambio > 0 else 0.0
+            if usd_input > 0 and tipo_cambio > 0:
+                st.info(f"🇲🇽 Equivalente en MXN: **${mxn_gastado:,.2f} MXN**")
 
         st.info(
             f"💲 Equivalente en USD: **${usd_equivalente:,.4f} USD**"
-            if mxn_gastado > 0
-            else "Ingresa el monto en MXN para ver el equivalente en USD."
+            if usd_equivalente > 0
+            else "Ingresa el monto para ver el equivalente en USD."
         )
 
     with col_der:
@@ -345,8 +403,8 @@ with tab_registro:
 
     if st.button("💾 Guardar registro", type="primary", use_container_width=True):
         errores = []
-        if mxn_gastado <= 0:
-            errores.append("La cantidad de MXN debe ser mayor a 0.")
+        if usd_equivalente <= 0:
+            errores.append("El monto gastado debe ser mayor a 0.")
         if btc_adquirido <= 0:
             errores.append("La cantidad de BTC debe ser mayor a 0.")
         if precio_btc_usd <= 0:
@@ -362,6 +420,7 @@ with tab_registro:
                 usd_equivalente,
                 btc_adquirido,
                 precio_btc_usd,
+                ("USD" if moneda_gasto != "MXN" else "MXN"),
                 notas,
             )
             st.success("✅ ¡Registro guardado exitosamente!")
@@ -572,6 +631,133 @@ with tab_historial:
             mime="text/csv",
             use_container_width=True,
         )
+
+        # Editar registro
+        st.markdown("---")
+        with st.expander("✏️ Editar un registro"):
+            ids_disponibles_edit = df["id"].tolist()
+            id_editar = st.selectbox(
+                "Selecciona el ID del registro a editar",
+                options=ids_disponibles_edit,
+                format_func=lambda x: f"ID {x} — {df.loc[df['id']==x, 'fecha'].values[0]}",
+                key="sel_id_editar",
+            )
+
+            fila = df.loc[df["id"] == id_editar].iloc[0]
+
+            # Cuando cambia el ID seleccionado, sincronizar session_state
+            # ANTES de renderizar los widgets para que muestren los datos correctos
+            if st.session_state.get("_edit_id_actual") != id_editar:
+                st.session_state["_edit_id_actual"]  = id_editar
+                st.session_state["edit_mxn"]         = float(fila["mxn_gastado"])
+                st.session_state["edit_tc"]          = float(fila["tipo_cambio_mxn_usd"])
+                st.session_state["edit_btc"]         = float(fila["btc_adquirido"])
+                st.session_state["edit_precio_usd"]  = float(fila["precio_compra_btc_usd"])
+                st.session_state["edit_notas"]       = fila["notas"] if fila["notas"] is not None else ""
+
+            col_e1, col_e2 = st.columns(2, gap="large")
+
+            with col_e1:
+                st.markdown("#### 💵 MXN / Tipo de cambio")
+                mxn_edit = st.number_input(
+                    "MXN gastados",
+                    min_value=0.0,
+                    step=100.0,
+                    format="%.2f",
+                    key="edit_mxn",
+                )
+                tc_edit = st.number_input(
+                    "Tipo de cambio (MXN por 1 USD)",
+                    min_value=0.01,
+                    step=0.01,
+                    format="%.4f",
+                    key="edit_tc",
+                )
+
+                usd_edit_calc = mxn_edit / tc_edit if tc_edit > 0 else 0.0
+                st.info(f"💲 USD equivalente (calculado): **${usd_edit_calc:,.4f} USD**")
+
+            with col_e2:
+                st.markdown("#### ₿ BTC / Precio de compra")
+                btc_edit = st.number_input(
+                    "BTC adquiridos",
+                    min_value=0.0,
+                    step=0.00001,
+                    format="%.8f",
+                    key="edit_btc",
+                )
+
+                modo_precio_edit = st.radio(
+                    "Editar precio BTC en:",
+                    options=["USD", "MXN"],
+                    horizontal=True,
+                    key="edit_modo_precio",
+                )
+
+                if modo_precio_edit == "MXN":
+                    precio_btc_mxn_sugerido = st.session_state["edit_precio_usd"] * tc_edit
+                    precio_btc_mxn_edit = st.number_input(
+                        "Precio de compra BTC (MXN)",
+                        min_value=0.0,
+                        value=float(precio_btc_mxn_sugerido),
+                        step=1000.0,
+                        format="%.2f",
+                        key="edit_precio_mxn",
+                    )
+                    precio_btc_usd_edit = (
+                        precio_btc_mxn_edit / tc_edit
+                        if tc_edit > 0 and precio_btc_mxn_edit > 0
+                        else 0.0
+                    )
+                    st.info(f"💲 Equivalente en USD: **${precio_btc_usd_edit:,.2f} USD**")
+                else:
+                    precio_btc_usd_edit = st.number_input(
+                        "Precio de compra BTC (USD)",
+                        min_value=0.0,
+                        step=100.0,
+                        format="%.2f",
+                        key="edit_precio_usd",
+                    )
+                    precio_mxn_calc = precio_btc_usd_edit * tc_edit if tc_edit > 0 else 0.0
+                    if precio_btc_usd_edit > 0:
+                        st.info(f"₿ Equivalente en MXN: **${precio_mxn_calc:,.2f} MXN**")
+
+            notas_edit = st.text_area(
+                "Notas (opcional)",
+                height=80,
+                key="edit_notas",
+            )
+
+            col_btn1, col_btn2 = st.columns([1, 3])
+            with col_btn1:
+                if st.button("Guardar cambios", type="primary", key="btn_guardar_edicion"):
+                    errores_edit = []
+                    if mxn_edit <= 0:
+                        errores_edit.append("La cantidad de MXN debe ser mayor a 0.")
+                    if btc_edit <= 0:
+                        errores_edit.append("La cantidad de BTC debe ser mayor a 0.")
+                    if precio_btc_usd_edit <= 0:
+                        errores_edit.append("El precio de compra del BTC debe ser mayor a 0.")
+                    if tc_edit <= 0:
+                        errores_edit.append("El tipo de cambio debe ser mayor a 0.")
+
+                    if errores_edit:
+                        for e in errores_edit:
+                            st.error(f"❌ {e}")
+                    else:
+                        actualizar_registro(
+                            int(id_editar),
+                            float(mxn_edit),
+                            float(tc_edit),
+                            float(btc_edit),
+                            float(precio_btc_usd_edit),
+                            "MXN" if modo_precio_edit == "MXN" else "USD",
+                            str(notas_edit),
+                        )
+                        # Limpiar estado para forzar recarga en la próxima apertura
+                        st.session_state.pop("_edit_id_actual", None)
+                        st.success("✅ Registro actualizado.")
+                        st.rerun()
 
         # Eliminar registro
         st.markdown("---")
